@@ -1,4 +1,4 @@
-package main
+package main // import "github.com/spaaza/route53-registrator"
 
 import (
 	"flag"
@@ -7,13 +7,13 @@ import (
 	"os"
 	"strings"
 
-	"github.com/awslabs/aws-sdk-go/aws"
-	"github.com/awslabs/aws-sdk-go/aws/awsutil"
-	"github.com/awslabs/aws-sdk-go/service/route53"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/awsutil"
+	"github.com/aws/aws-sdk-go/service/route53"
 	dockerapi "github.com/fsouza/go-dockerclient"
 	"github.com/golang/glog"
-
-	"github.com/brandnetworks/route53-registrator/healthcheck"
+	"io"
 )
 
 func getopt(name, def string) string {
@@ -29,31 +29,13 @@ func assert(err error) {
 	}
 }
 
-func containerIsRunning(client *dockerapi.Client, containerName string) (running bool, err error) {
-	//defaults to only the running containers
-	containers, err := client.ListContainers(dockerapi.ListContainersOptions{})
-	if err != nil {
-		return false, err
-	}
-	found := false
-	for _, container := range containers {
-		for _, name := range container.Names {
-			if normalizedContainerName(name) == normalizedContainerName(containerName) {
-				found = true
-				break
-			}
-		}
-	}
-	return found, nil
-}
-
-func recordExists(client *route53.Route53, zoneId string, cname string, value string) (exists bool, err error) {
-	matchingResourceRecords, err := findMatchingResourceRecordsByName(client, zoneId, cname)
+func recordExists(client *route53.Route53, zoneId string, zoneName string, value string) (exists bool, err error) {
+	matchingResourceRecords, err := findMatchingResourceRecordsByName(client, zoneId, zoneName)
 	exists = false
 	for _, recordSet := range matchingResourceRecords {
 		for _, record := range recordSet.ResourceRecords {
 			if *record.Value == value {
-				glog.Infof("Found existing record with Name %s and value %s.", cname, value)
+				glog.Infof("Found existing record with Name %s and value %s.", zoneName, value)
 				exists = true
 			}
 		}
@@ -61,10 +43,10 @@ func recordExists(client *route53.Route53, zoneId string, cname string, value st
 	return exists, nil
 }
 
-//uses the ec2 metadata service to retrieve the public
-//cname for the instance
+//uses the ec2 metadata service to retrieve the private
+//IP for the instance
 func hostname(metadataServerAddress string) (hostname string) {
-	host := []string{"http:/", metadataServerAddress, "latest", "meta-data", "public-hostname"}
+	host := []string{"http:/", metadataServerAddress, "latest", "meta-data", "local-ipv4"}
 	resp, err := http.Get(strings.Join(host, "/"))
 	assert(err)
 
@@ -75,7 +57,7 @@ func hostname(metadataServerAddress string) (hostname string) {
 	return string(body)
 }
 
-//container names start with a /. This function removes the leading / if it exists.
+//container names start with a /. This function adds the leading / if it doesn't exist.
 func normalizedContainerName(original string) (normalized string) {
 	if strings.HasPrefix(original, "/") {
 		return original
@@ -83,14 +65,32 @@ func normalizedContainerName(original string) (normalized string) {
 	return strings.Join([]string{"/", original}, "")
 }
 
-//Given a container ID and a name, assert whether the name of the container matches that of the provided name.
-func isObservedContainer(client *dockerapi.Client, containerId string, targetContainerName string) (observed bool) {
+func ecsContainerFamilyLabel(client *dockerapi.Client, containerId string) (ecsContainerLabel string) {
 	container, err := client.InspectContainer(containerId)
-	assert(err)
-	if container.Name == targetContainerName {
+	if err != nil {
+		glog.Error(err)
+	} else if ecsContainerLabel, ok := container.Config.Labels["com.amazonaws.ecs.task-definition-family"]; ok {
+		return ecsContainerLabel
+	}
+	return "";
+}
+
+func ecsContainerNameLabel(client *dockerapi.Client, containerId string) (ecsContainerLabel string) {
+	container, err := client.InspectContainer(containerId)
+	if err != nil {
+		glog.Error(err)
+	} else if ecsContainerLabel, ok := container.Config.Labels["com.amazonaws.ecs.container-name"]; ok {
+		return ecsContainerLabel
+	}
+	return "";
+}
+
+//Given a container label check whether we should observe it for registrations and deletions
+func isObservedContainer(ecsContainerLabel string) (observed bool) {
+	if strings.HasSuffix(ecsContainerLabel, "-service") { // a convention
 		return true
 	}
-	glog.Infof("Container ", containerId, " did not match name", targetContainerName)
+	glog.Infof("Container label: %s is not a service that should be registered", ecsContainerLabel)
 	return false
 }
 
@@ -99,9 +99,9 @@ func findMatchingResourceRecordsByName(client *route53.Route53, zone string, set
 	resources, err := client.ListResourceRecordSets(&route53.ListResourceRecordSetsInput{
 		HostedZoneID: aws.String(zone),
 	})
-	if awserr := aws.Error(err); awserr != nil {
+	if awserr, ok := err.(awserr.Error); ok {
 		// A service error occurred.
-		glog.Errorf("AWS Error: \n Code: %s \n Message: %s", awserr.Code, awserr.Message)
+		glog.Errorf("AWS Error: \n Code: %s \n Message: %s \n awsErr.OrigErr: %v", awserr.Code(), awserr.Message(), awserr.OrigErr())
 		return nil, err
 	} else if err != nil {
 		// A non-service error occurred.
@@ -120,16 +120,15 @@ func findMatchingResourceRecordsByName(client *route53.Route53, zone string, set
 
 //Creates a ResourceRecordSet with a default TTL and Weight.
 //The SetIdentifier equals the the hostname of the server.
-func WeightedCNAMEForValue(cname string, value string, healthCheck string) (resourceRecordSet *route53.ResourceRecordSet) {
+func WeightedResourceRecordSetForValue(zoneName string, value string) (resourceRecordSet *route53.ResourceRecordSet) {
 	return &route53.ResourceRecordSet{
-		Name: aws.String(cname),
-		Type: aws.String("CNAME"),
+		Name: aws.String(zoneName),
+		Type: aws.String("A"),
 		ResourceRecords: []*route53.ResourceRecord{
 			&route53.ResourceRecord{
 				Value: aws.String(value),
 			},
 		},
-		HealthCheckID: aws.String(healthCheck),
 		SetIdentifier: aws.String(value),
 		TTL:           aws.Long(5),
 		Weight:        aws.Long(50),
@@ -151,12 +150,12 @@ func paramsForChangeResourceRecordRequest(client *route53.Route53, action string
 	return *params
 }
 
-//Defines a Route53 request for a CNAME
-type requestFn func(client *route53.Route53, action string, zoneId string, healthcheckId string, cname string, value string) (resp *route53.ChangeResourceRecordSetsOutput, err error)
+//Defines a Route53 request for a weighted resource record set
+type requestFn func(client *route53.Route53, action string, zoneId string, zoneName string, value string) (resp *route53.ChangeResourceRecordSetsOutput, err error)
 
 //Executes the ChangeResourceRecordSet
-func route53ChangeRequest(client *route53.Route53, action string, zoneId string, healthcheckId string, cname string, value string) (resp *route53.ChangeResourceRecordSetsOutput, err error) {
-	resourceRecordSet := WeightedCNAMEForValue(cname, value, healthcheckId)
+func route53ChangeRequest(client *route53.Route53, action string, zoneId string, zoneName string, value string) (resp *route53.ChangeResourceRecordSetsOutput, err error) {
+	resourceRecordSet := WeightedResourceRecordSetForValue(zoneName, value)
 	params := paramsForChangeResourceRecordRequest(client, action, zoneId, resourceRecordSet)
 	return client.ChangeResourceRecordSets(&params)
 }
@@ -165,10 +164,10 @@ func route53ChangeRequest(client *route53.Route53, action string, zoneId string,
 //and returns a requestFn that handles errors resulting
 //from it's execution
 func ErrorHandledRequestFn(reqFn requestFn) (wrapped requestFn) {
-	return func(route53Client *route53.Route53, action string, zoneId string, healthcheckId string, cname string, value string) (resp *route53.ChangeResourceRecordSetsOutput, err error) {
-		resp, err = reqFn(route53Client, action, zoneId, healthcheckId, cname, value)
-		if awserr := aws.Error(err); awserr != nil {
-			glog.Errorf("AWS Error: \n Code: %s \n Message: %s", awserr.Code, awserr.Message)
+	return func(route53Client *route53.Route53, action string, zoneId string, zoneName string, value string) (resp *route53.ChangeResourceRecordSetsOutput, err error) {
+		resp, err = reqFn(route53Client, action, zoneId, zoneName, value)
+		if awserr, ok := err.(awserr.Error); ok {
+			glog.Errorf("AWS Error: \n Code: %s \n Message: %s \n awsErr.OrigErr(): %v", awserr.Code(), awserr.Message(), awserr.OrigErr())
 			return nil, err
 		} else if err != nil {
 			// A non-service error occurred.
@@ -181,109 +180,80 @@ func ErrorHandledRequestFn(reqFn requestFn) (wrapped requestFn) {
 }
 
 //Specifies a type of function used to dispatch
-type requestFnForZoneClient func(action string, healthcheckId string, cname string, value string) (resp *route53.ChangeResourceRecordSetsOutput, err error)
+type requestFnForZoneClient func(action string, zoneName string, value string) (resp *route53.ChangeResourceRecordSetsOutput, err error)
 
 func requestFnForClientZone(client *route53.Route53, zoneId string, fn requestFn) (curried requestFnForZoneClient) {
-	return func(action string, healthcheckId string, cname string, value string) (resp *route53.ChangeResourceRecordSetsOutput, err error) {
-		return fn(client, action, zoneId, healthcheckId, cname, value)
+	return func(action string, zoneName string, value string) (resp *route53.ChangeResourceRecordSetsOutput, err error) {
+		return fn(client, action, zoneId, zoneName, value)
 	}
 }
 
 func main() {
-	var containerName = flag.String("container", "docker-registry", "The container to watch")
 	var metadataIP = flag.String("metadata", "169.254.169.254", "The address of the metadata service")
 	var region = flag.String("region", "us-east-1", "The region for route53 records")
 	var zoneId = flag.String("zone", "Z1P7DHMHEAX6O3", "The route53 hosted zone id")
-	var cname = flag.String("cname", "my-test-registry.realtime.bnservers.com", "The CNAME for the record set")
-	var healthCheckPort = flag.Int64("healthCheckPort", 1000, "The port to run the healthcheck on")
-	var healthCheckEndpoint = flag.String("healthCheckEndpoint", "/status", "The status URL")
+	var listenAddr = flag.String("listenAddr", ":12000", "Address for HTTP listener")
 
 	//Print some debug information
 	flag.Parse()
 	glog.Info(*region)
 	glog.Info(*metadataIP)
-	glog.Info(*cname)
 	glog.Info(*zoneId)
-	glog.Info(*containerName)
 
 	docker, err := dockerapi.NewClient(getopt("DOCKER_HOST", "unix:///tmp/docker.sock"))
 	assert(err)
 	err = docker.Ping()
 	assert(err)
 
-	//the container name we're looking for
-	targetContainer := normalizedContainerName(*containerName)
-
 	events := make(chan *dockerapi.APIEvents)
 	assert(docker.AddEventListener(events))
 	client := route53.New(nil)
 
-	weightedCNAMEFn := ErrorHandledRequestFn(route53ChangeRequest)
-	weightedRequestForClientZone := requestFnForClientZone(client, *zoneId, weightedCNAMEFn)
+	// Start a web server so that we can bind a port on ECS to ensure we get a registrator per instance in the cluster.
+	http.HandleFunc("/", func (w http.ResponseWriter, r *http.Request) {
+	io.WriteString(w, "OK")
+	})
+	go http.ListenAndServe(*listenAddr, nil)
 
-	healthCheckId, err := healthcheck.CreateHealthCheckIfMissing(client, hostname(*metadataIP), *healthCheckPort, *healthCheckEndpoint)
-	//check if the named container is alive on the host
-	running, err := containerIsRunning(docker, *containerName)
-	if err != nil {
-		glog.Errorf("Error checking for existing container: %s", err)
-	}
-
-	//if the container is running, then check if there is an existing record pointing
-	//to this host. If there is not, then create one.
-	if running {
-		glog.Infof("Container with name %s is already running. Checking for existing record", *containerName)
-		exists, err := recordExists(client, *zoneId, *cname, hostname(*metadataIP))
-		if err != nil {
-			glog.Errorf("Error checking for existing container: %v", err)
-		}
-		if !exists {
-			glog.Infof("No existing record exists with Name %s and value %s. Creating.", *cname, hostname(*metadataIP))
-			weightedRequestForClientZone("CREATE", healthCheckId, *cname, hostname(*metadataIP))
-		}
-		if err != nil {
-			glog.Errorf("Error searching for exisiting records:", err)
-		}
-	}
+	weightedResourceRecordSetFn := ErrorHandledRequestFn(route53ChangeRequest)
+	weightedRequestForClientZone := requestFnForClientZone(client, *zoneId, weightedResourceRecordSetFn)
 
 	glog.Infof("Listening for Docker events ...")
 
 	// Process Docker events
 	for msg := range events {
+		ecsContainerLabel := ecsContainerFamilyLabel(docker, msg.ID)
+		zoneName := ecsContainerNameLabel(docker, msg.ID) + ".service.discovery."
 		switch msg.Status {
 		case "start":
-			glog.Infof("Event: container %s started. Creating record and Health Check", msg.ID)
-			if isObservedContainer(docker, msg.ID, targetContainer) {
-				healthCheckId, err := healthcheck.CreateHealthCheckIfMissing(client, hostname(*metadataIP), *healthCheckPort, *healthCheckEndpoint)
-				if err != nil {
-					glog.Errorf("Error deleting route")
-				}
-				exists, err := recordExists(client, *zoneId, *cname, hostname(*metadataIP))
+			if isObservedContainer(ecsContainerLabel) {
+				glog.Infof("Event: container %s started. Creating record: %s", msg.ID, zoneName)
+				exists, err := recordExists(client, *zoneId, zoneName, hostname(*metadataIP))
 				if err != nil {
 					glog.Errorf("Error checking for existing container: %v", err)
 				}
 				if !exists {
-					weightedRequestForClientZone("CREATE", healthCheckId, *cname, hostname(*metadataIP))
+					weightedRequestForClientZone("CREATE", zoneName, hostname(*metadataIP))
 					if err != nil {
 						glog.Errorf("Error creating route")
+					} else {
+						glog.Info("Create attempt complete.")
 					}
 				} else {
 					glog.Infof("Record already exists. Not creating")
 				}
 			}
-		case "die":
-			glog.Infof("Event: container %s died. Deleting Record and Health Check", msg.ID)
-			if isObservedContainer(docker, msg.ID, targetContainer) {
-				healthCheckId, err := healthcheck.CreateHealthCheckIfMissing(client, hostname(*metadataIP), *healthCheckPort, *healthCheckEndpoint)
-				if err != nil {
-					glog.Errorf("Error deleting route")
-				}
-				exists, err := recordExists(client, *zoneId, *cname, hostname(*metadataIP))
+		case "die", "stop", "kill": // FIXME. More than one of these can happen
+		// FIXME: Think about one day how we might have multiple services running on a single host. Then we should switch to SRV records and take the port into account.
+			if isObservedContainer(ecsContainerLabel) {
+				glog.Infof("Event: container %s %s. Deleting Record: %s", msg.ID, *msg, zoneName)
+				exists, err := recordExists(client, *zoneId, zoneName, hostname(*metadataIP))
 				if err != nil {
 					glog.Errorf("Error checking for existing container: %v", err)
 				}
 				if exists {
-					weightedRequestForClientZone("DELETE", healthCheckId, *cname, hostname(*metadataIP))
-					healthcheck.DeleteHealthCheck(client, healthCheckId)
+					weightedRequestForClientZone("DELETE", zoneName, hostname(*metadataIP))
+					glog.Info("Deletion attempt complete.")
 				} else {
 					glog.Infof("Suitable record doesn't exist. Not deleting")
 				}

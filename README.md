@@ -2,7 +2,7 @@
 
 ## What is it
 
-Allows basic load balancedservice discovery using a Route53 private hosted zone in your VPC.
+Allows basic load balanced service discovery using a Route53 private hosted zone in your VPC.
 
  * Run this in a Docker container on each AWS ECS instances in your cluster.
  * It listens to Docker events when services are stopped and started and adds and removes A records to a private hosted 
@@ -10,6 +10,7 @@ Allows basic load balancedservice discovery using a Route53 private hosted zone 
  * It follows the convention of looking at the ECS related tags on containers. If the "family" specified in the task 
  definition ends with ".service" then the container is treated as something that should be registered in DNS.
  * The A record is registered under a zone using this naming convention <container-name>.service.discovery.
+ * Use the registered host in the configuration of other task definitions that need to call the service.
  * Route53 can only run health checks on internet accessible hosts so there is no health checking code.
 
 Forked from [brandnetworks/route53-registrator](https://github.com/brandnetworks/route53-registrator).
@@ -34,14 +35,13 @@ The program uses the ec2 metadata service to retrieve the hostname for the insta
 
 ### Make tasks:
 
- - `build/container`: 
-     - Builds the binary image (compiled only for linux amd64)
-     - Builds a Docker container to run the binary
+ - `image`: 
+     - Builds a minimal scratch image with a static binary using the Centurylink golang-builder
  - `dev`:
      - Runs the latest built docker container, passing AWS credentials as env variables and 
        some sane defaults
  - `release`:
-     - Pushes the latest image to the public docker index (it's tied to my account right now)
+     - Pushes the latest image to the public docker index
 
 
 ## A note on `ca-bundle.crt`:
